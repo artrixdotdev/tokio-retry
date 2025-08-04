@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_retry2::strategy::ExponentialBackoff;
-use tokio_retry2::{Retry, RetryError, RetryIf};
+use tokio_retry2::{notify::NotifyFn, Retry, RetryError, RetryIf};
 
 #[tokio::test]
 async fn attempts_just_once() {
@@ -85,21 +85,20 @@ async fn attempts_retry_only_if_given_condition_is_true() {
     let counter = Arc::new(AtomicUsize::new(0));
     let cloned_counter = counter.clone();
     #[allow(clippy::complexity)]
-    let future: RetryIf<Take<FixedInterval>, _, fn(&usize) -> _, fn(&usize, Duration) -> _> =
-        RetryIf::spawn(
-            s,
-            move || {
-                let previous = cloned_counter.fetch_add(1, Ordering::SeqCst);
-                future::ready(Err::<(), RetryError<usize>>(RetryError::transient(
-                    previous + 1,
-                )))
-            },
-            |e: &usize| *e < 3,
-            |e: &usize, d: Duration| {
-                assert!(e == &1 || e == &2);
-                assert!(d == Duration::from_millis(0) || d == Duration::from_millis(100));
-            },
-        );
+    let future: RetryIf<Take<FixedInterval>, _, fn(&usize) -> _> = RetryIf::spawn(
+        s,
+        move || {
+            let previous = cloned_counter.fetch_add(1, Ordering::SeqCst);
+            future::ready(Err::<(), RetryError<usize>>(RetryError::transient(
+                previous + 1,
+            )))
+        },
+        |e: &usize| *e < 3,
+        Some(NotifyFn::from_sync(|e: &usize, d: Duration| {
+            assert!(e == &1 || e == &2);
+            assert!(d == Duration::from_millis(0) || d == Duration::from_millis(100));
+        })),
+    );
     let res = future.await;
 
     assert_eq!(res, Err(3));

@@ -9,8 +9,8 @@ use std::task::{Context, Poll};
 use pin_project::pin_project;
 use tokio::time::{sleep_until, Duration, Instant, Sleep};
 
+use super::notify::{Notify, NotifyFn};
 use crate::error::Error as RetryError;
-use crate::notify::Notify;
 
 use super::action::Action;
 use super::condition::Condition;
@@ -49,7 +49,7 @@ where
     A: Action,
 {
     #[pin]
-    retry_if: RetryIf<I, A, fn(&A::Error) -> bool, fn(&A::Error, std::time::Duration)>,
+    retry_if: RetryIf<I, A, fn(&A::Error) -> bool>,
 }
 
 impl<I, A> Retry<I, A>
@@ -62,12 +62,7 @@ where
         action: A,
     ) -> Retry<I, A> {
         Retry {
-            retry_if: RetryIf::spawn(
-                strategy,
-                action,
-                (|_| true) as fn(&A::Error) -> bool,
-                (|_, _| {}) as fn(&A::Error, std::time::Duration),
-            ),
+            retry_if: RetryIf::spawn(strategy, action, (|_| true) as fn(&A::Error) -> bool, None),
         }
     }
 
@@ -75,13 +70,34 @@ where
         strategy: T,
         action: A,
         notify: fn(&A::Error, std::time::Duration),
-    ) -> Retry<I, A> {
+    ) -> Retry<I, A>
+    where
+        <A as Action>::Error: 'static,
+    {
         Retry {
             retry_if: RetryIf::spawn(
                 strategy,
                 action,
                 (|_| true) as fn(&A::Error) -> bool,
-                notify,
+                Some(NotifyFn::from_sync(notify)),
+            ),
+        }
+    }
+
+    pub fn spawn_notify_async<T: IntoIterator<IntoIter = I, Item = Duration>>(
+        strategy: T,
+        action: A,
+        notify: fn(&A::Error, std::time::Duration) -> Pin<Box<dyn Future<Output = ()> + Send>>,
+    ) -> Retry<I, A>
+    where
+        <A as Action>::Error: 'static,
+    {
+        Retry {
+            retry_if: RetryIf::spawn(
+                strategy,
+                action,
+                (|_| true) as fn(&A::Error) -> bool,
+                Some(NotifyFn::from_async(notify)),
             ),
         }
     }
@@ -103,12 +119,11 @@ where
 /// Future that drives multiple attempts at an action via a retry strategy. Retries are only attempted if
 /// the `Error` returned by the future satisfies a given condition.
 #[pin_project]
-pub struct RetryIf<I, A, C, N>
+pub struct RetryIf<I, A, C>
 where
     I: Iterator<Item = Duration>,
     A: Action,
     C: Condition<A::Error>,
-    N: Notify<A::Error>,
 {
     strategy: I,
     #[pin]
@@ -116,22 +131,21 @@ where
     action: A,
     condition: C,
     duration: Duration,
-    notify: N,
+    notify: Option<NotifyFn<A::Error>>,
 }
 
-impl<I, A, C, N> RetryIf<I, A, C, N>
+impl<I, A, C> RetryIf<I, A, C>
 where
     I: Iterator<Item = Duration>,
     A: Action,
     C: Condition<A::Error>,
-    N: Notify<A::Error>,
 {
     pub fn spawn<T: IntoIterator<IntoIter = I, Item = Duration>>(
         strategy: T,
         mut action: A,
         condition: C,
-        notify: N,
-    ) -> RetryIf<I, A, C, N> {
+        notify: Option<NotifyFn<A::Error>>,
+    ) -> RetryIf<I, A, C> {
         RetryIf {
             strategy: strategy.into_iter(),
             state: RetryState::Running(action.run()),
@@ -179,12 +193,11 @@ where
     }
 }
 
-impl<I, A, C, N> Future for RetryIf<I, A, C, N>
+impl<I, A, C> Future for RetryIf<I, A, C>
 where
     I: Iterator<Item = Duration>,
     A: Action,
     C: Condition<A::Error>,
-    N: Notify<A::Error>,
 {
     type Output = Result<A::Item, A::Error>;
 
@@ -199,7 +212,9 @@ where
                         if self.as_mut().project().condition.should_retry(&err) {
                             let duration =
                                 retry_after.unwrap_or(self.as_ref().project_ref().duration.clone());
-                            self.as_mut().project().notify.notify(&err, duration);
+                            if let Some(notify) = self.as_mut().project().notify.as_mut() {
+                                notify.notify(&err, duration);
+                            }
                             *self.as_mut().project().duration = duration;
                             match self.retry(err, cx) {
                                 Ok(poll) => poll,

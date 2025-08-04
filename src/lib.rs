@@ -152,7 +152,7 @@ mod action;
 mod condition;
 pub(crate) mod error;
 mod future;
-mod notify;
+pub mod notify;
 /// Assorted retry strategies including fixed interval and exponential back-off.
 pub mod strategy;
 
